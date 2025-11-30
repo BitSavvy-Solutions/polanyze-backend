@@ -51,7 +51,7 @@ def smart_legal_chunking(text):
     Chunk size increased to 2000 to reduce API calls for large docs.
     """
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500, 
+        chunk_size=1000, 
         chunk_overlap=200,
         length_function=len,
         is_separator_regex=True,
