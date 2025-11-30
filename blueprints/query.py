@@ -29,62 +29,86 @@ def get_embedding(text):
     response = openai_client.embeddings.create(input=text, model="text-embedding-3-small")
     return response.data[0].embedding
 
-def vector_search(tx, question_vector, limit=5):
-    # Query the Vector Index
-    # Note: You must create the index 'chunk_embeddings' in Neo4j first!
+# --- 1. GENERAL SEARCH ---
+def vector_search_general(tx, question_vector, limit=5):
     query = """
     CALL db.index.vector.queryNodes('chunk_embeddings', $limit, $embedding)
     YIELD node AS chunk, score
     MATCH (p:Policy)-[:HAS_CHUNK]->(chunk)
-    RETURN 
-        p.title AS policy_title, 
-        p.id AS policy_id, 
-        p.sector AS sector,
-        chunk.content AS text, 
-        score
+    RETURN p.title AS policy_title, p.id AS policy_id, chunk.content AS text, score
     """
     result = tx.run(query, embedding=question_vector, limit=limit)
     return [record.data() for record in result]
 
+# --- 2. DEEP DIVE (Graph + Ontology) ---
+def graph_search_specific_doc(tx, doc_id, question_vector):
+    query = """
+    CALL db.index.vector.queryNodes('chunk_embeddings', 10, $embedding)
+    YIELD node AS chunk, score
+    
+    MATCH (p:Policy {id: $doc_id})-[:HAS_CHUNK]->(chunk)
+    
+    // Traverse Graph for Context
+    MATCH (section:Section)-[:CONTAINS]->(chunk)
+    OPTIONAL MATCH (chunk)-[:AFFECTS]->(subject:Entity)
+    OPTIONAL MATCH (chunk)-[:MENTIONS]->(topic:Topic)
+    
+    RETURN 
+        section.title AS section_title,
+        chunk.legal_type AS legal_type,
+        subject.name AS subject,
+        chunk.content AS text,
+        collect(topic.name) AS related_topics,
+        score
+    ORDER BY score DESC
+    LIMIT 3
+    """
+    result = tx.run(query, doc_id=doc_id, embedding=question_vector)
+    return [record.data() for record in result]
+
 @query_bp.route(route="query_policy", auth_level=func.AuthLevel.ANONYMOUS)
 def query_policy(req: func.HttpRequest) -> func.HttpResponse:
-    logging.info('Query Policy triggered.')
-
     try:
         req_body = req.get_json()
         question = req_body.get('question')
+        if not question: return func.HttpResponse("Missing question", status_code=400)
 
-        if not question:
-            return func.HttpResponse("Missing 'question' in body", status_code=400)
-
-        if not openai_client or not neo4j_driver:
-             return func.HttpResponse("Database or OpenAI not configured", status_code=500)
-
-        # 1. Embed the Question
         q_vector = get_embedding(question)
-
-        # 2. Search Neo4j
+        
         results = []
         with neo4j_driver.session() as session:
-            results = session.execute_read(vector_search, question_vector=q_vector)
+            results = session.execute_read(vector_search_general, q_vector)
 
-        # 3. Format Response
-        # Group by Policy to show which documents are most relevant
-        formatted_results = []
+        unique_docs = {}
         for r in results:
-            formatted_results.append({
-                "document_title": r['policy_title'],
-                "sector": r.get('sector', 'N/A'),
-                "relevance_score": r['score'],
-                "snippet": r['text']
-            })
+            doc_id = r['policy_id']
+            if doc_id not in unique_docs:
+                unique_docs[doc_id] = {
+                    "title": r['policy_title'],
+                    "id": doc_id,
+                    "best_match_snippet": r['text'],
+                    "score": r['score']
+                }
 
-        return func.HttpResponse(
-            json.dumps({"matches": formatted_results}),
-            mimetype="application/json",
-            status_code=200
-        )
-
+        return func.HttpResponse(json.dumps({"matches": list(unique_docs.values())}), mimetype="application/json")
     except Exception as e:
-        logging.error(f"Error: {e}")
+        return func.HttpResponse(f"Error: {str(e)}", status_code=500)
+
+@query_bp.route(route="query_document_details", auth_level=func.AuthLevel.ANONYMOUS)
+def query_document_details(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        req_body = req.get_json()
+        question = req_body.get('question')
+        doc_id = req_body.get('doc_id')
+        
+        if not question or not doc_id: return func.HttpResponse("Missing question or doc_id", status_code=400)
+
+        q_vector = get_embedding(question)
+        
+        results = []
+        with neo4j_driver.session() as session:
+            results = session.execute_read(graph_search_specific_doc, doc_id, q_vector)
+
+        return func.HttpResponse(json.dumps({"analysis": results}), mimetype="application/json")
+    except Exception as e:
         return func.HttpResponse(f"Error: {str(e)}", status_code=500)
