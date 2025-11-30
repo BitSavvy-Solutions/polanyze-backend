@@ -10,7 +10,6 @@ from azure.cosmos import CosmosClient
 from azure.storage.queue import QueueClient
 
 # --- CONFIGURATION ---
-# We keep Cosmos global because it's heavy to initialize
 series_container = None
 versions_container = None
 
@@ -43,69 +42,82 @@ def ingest_policy(req: func.HttpRequest) -> func.HttpResponse:
         if not req_body:
              return func.HttpResponse("Empty Body", status_code=400)
 
+        # Extract Fields
         title = req_body.get('title')
         country = req_body.get('country')
-        entity = req_body.get('entity')
+        entity = req_body.get('entity') # e.g. "Federal", "Provincial"
+        text_content = req_body.get('text_content') # The raw text of the policy
         
-        if not all([title, country, entity]):
-            return func.HttpResponse("Missing required fields", status_code=400)
+        # New B2B Fields
+        sector = req_body.get('sector', 'General')
+        province = req_body.get('province', 'N/A')
+        
+        if not all([title, country, entity, text_content]):
+            return func.HttpResponse("Missing required fields: title, country, entity, or text_content", status_code=400)
 
         # Generate IDs
         series_id = generate_series_id(country, entity, title)
         version_id = str(uuid.uuid4())
 
-        # --- 1. SAVE TO COSMOS ---
+        # --- 1. SAVE TO COSMOS (Metadata & Status) ---
         if versions_container:
             version_item = {
                 "id": version_id,
                 "series_id": series_id,
                 "status": "Queued",
                 "ingested_at": datetime.utcnow().isoformat(),
-                "details": req_body
+                "metadata": {
+                    "sector": sector,
+                    "province": province,
+                    "title": title
+                }
+                # Note: We are NOT saving text_content to Cosmos to save money/space, 
+                # but you can add it here if you want a backup.
             }
             versions_container.create_item(body=version_item)
-        else:
-            return func.HttpResponse("Cosmos DB not connected", status_code=500)
 
         # --- 2. SEND TO QUEUE ---
-        # We initialize the client HERE to catch errors immediately
         try:
             conn_str = os.environ.get("AzureWebJobsStorage")
             if not conn_str:
                 raise Exception("AzureWebJobsStorage environment variable is missing")
 
-            # Connect to Queue
             queue_client = QueueClient.from_connection_string(conn_str, "policy-ingest-queue")
             
-            # Create if not exists (safe to run multiple times)
             try:
                 queue_client.create_queue()
             except:
                 pass 
 
-            # Prepare Message
+            # Prepare Message (Includes the heavy text content)
             message_payload = {
                 "series_id": series_id,
                 "version_id": version_id,
-                "data": req_body
+                "data": {
+                    "title": title,
+                    "country": country,
+                    "entity": entity,
+                    "sector": sector,
+                    "province": province,
+                    "text_content": text_content
+                }
             }
+            
             message_string = json.dumps(message_payload)
             message_bytes = message_string.encode('utf-8')
             
-            # Send
             queue_client.send_message(base64.b64encode(message_bytes).decode('utf-8'))
             logging.info(f"✅ Message sent to queue for {series_id}")
 
         except Exception as q_error:
             logging.error(f"❌ Queue Error: {q_error}")
-            # We return 500 because if the queue fails, the process is broken
             return func.HttpResponse(f"Queue Error: {str(q_error)}", status_code=500)
 
         return func.HttpResponse(
             json.dumps({
                 "message": "Ingestion initiated.", 
                 "status": "Queued",
-                "id": version_id
+                "id": series_id
             }),
             status_code=202
         )
