@@ -1,3 +1,5 @@
+# ... imports ...
+# (Keep existing imports and config)
 import azure.functions as func
 import logging
 import os
@@ -49,17 +51,26 @@ def ingest_policy(req: func.HttpRequest) -> func.HttpResponse:
         sector = req_body.get('sector', 'General')
         province = req_body.get('province', 'N/A')
         
+        # --- UPDATE LOGIC: Check if series_id is provided ---
+        existing_series_id = req_body.get('series_id')
+
         if not all([title, country, entity, text_content]):
             return func.HttpResponse("Missing required fields", status_code=400)
 
-        series_id = generate_series_id(country, entity, title)
+        # If updating, use existing ID. If new, generate ID.
+        if existing_series_id:
+            series_id = existing_series_id
+            logging.info(f"Updating existing policy: {series_id}")
+        else:
+            series_id = generate_series_id(country, entity, title)
+            logging.info(f"Creating new policy: {series_id}")
+
         version_id = str(uuid.uuid4())
 
         # --- 1. UPLOAD TO BLOB STORAGE (Handle 5MB+ files) ---
         conn_str = os.environ.get("AzureWebJobsStorage")
         blob_service_client = BlobServiceClient.from_connection_string(conn_str)
         
-        # Create container 'policy-documents' if not exists
         container_name = "policy-documents"
         container_client = blob_service_client.get_container_client(container_name)
         if not container_client.exists():
@@ -88,7 +99,6 @@ def ingest_policy(req: func.HttpRequest) -> func.HttpResponse:
         try: queue_client.create_queue()
         except: pass 
 
-        # We pass the LOCATION of the data, not the data itself
         message_payload = {
             "series_id": series_id,
             "version_id": version_id,
@@ -98,8 +108,8 @@ def ingest_policy(req: func.HttpRequest) -> func.HttpResponse:
                 "entity": entity,
                 "sector": sector,
                 "province": province,
-                "container": container_name, # <--- Blob Info
-                "blob_name": blob_name       # <--- Blob Info
+                "container": container_name,
+                "blob_name": blob_name
             }
         }
         

@@ -3,11 +3,13 @@ import logging
 import os
 import json
 from neo4j import GraphDatabase
+from azure.cosmos import CosmosClient # Added Cosmos
 from openai import OpenAI
 
 # --- CONFIGURATION ---
 openai_client = None
 neo4j_driver = None
+series_container = None # Added Cosmos Container
 
 try:
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -19,6 +21,16 @@ try:
     neo_pass = os.environ.get("NEO4J_PASSWORD")
     if neo_uri:
         neo4j_driver = GraphDatabase.driver(neo_uri, auth=(neo_user, neo_pass))
+
+    # --- ADDED COSMOS INIT ---
+    c_endpoint = os.environ.get("COSMOS_ENDPOINT")
+    c_key = os.environ.get("COSMOS_KEY")
+    c_db = os.environ.get("COSMOS_DATABASE")
+    if c_endpoint:
+        client = CosmosClient(url=c_endpoint, credential=c_key)
+        db = client.get_database_client(c_db)
+        series_container = db.get_container_client("PolicySeries")
+
 except Exception as e:
     logging.error(f"Init Error: {e}")
 
@@ -29,6 +41,27 @@ def get_embedding(text):
     response = openai_client.embeddings.create(input=text, model="text-embedding-3-small")
     return response.data[0].embedding
 
+# --- NEW ROUTE: GET ALL POLICIES ---
+@query_bp.route(route="get_all_policies", auth_level=func.AuthLevel.ANONYMOUS)
+def get_all_policies(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        if not series_container:
+            return func.HttpResponse("Database connection not initialized", status_code=500)
+
+        # Query all items from PolicySeries container
+        # In a real app, you might want to implement pagination here
+        query = "SELECT * FROM c"
+        items = list(series_container.query_items(
+            query=query,
+            enable_cross_partition_query=True
+        ))
+
+        return func.HttpResponse(json.dumps(items), mimetype="application/json")
+    except Exception as e:
+        logging.error(f"Error fetching policies: {e}")
+        return func.HttpResponse(f"Error: {str(e)}", status_code=500)
+
+# ... (Keep vector_search_general, graph_search_specific_doc, query_policy, and query_document_details as they were) ...
 # --- 1. GENERAL SEARCH ---
 def vector_search_general(tx, question_vector, limit=5):
     query = """
